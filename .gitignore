@@ -13,7 +13,9 @@ Build/
 # Archive
 Scripts/CompileDISCONHereCopyRun\.cmd
 \.vs/
+\#Archive
 
 # Temp Files
 *~
+*.u2d
 .DS_Store
