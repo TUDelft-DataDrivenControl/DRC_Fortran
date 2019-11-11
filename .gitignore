@@ -12,7 +12,7 @@ Source/Release/
 # Archive
 Scripts/CompileDISCONHereCopyRun\.cmd
 \.vs/
-\#Archive
+# \#Archive
 
 # Temp Files
 *~
