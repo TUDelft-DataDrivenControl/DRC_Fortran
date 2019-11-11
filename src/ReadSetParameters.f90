@@ -1,14 +1,17 @@
 MODULE ReadSetParameters
 
     USE, INTRINSIC :: ISO_C_Binding
+
+USE Constants
+USE Functions
+
     IMPLICIT NONE
 
 CONTAINS
-    !..............................................................................................................................
+    ! -----------------------------------------------------------------------------------
     ! Read all constant control parameters from DISCON.IN parameter file
-    !..............................................................................................................................
     SUBROUTINE ReadControlParameterFileSub(CntrPar)
-        USE DRC_Types, ONLY : ControlParameters
+        USE ROSCO_Types, ONLY : ControlParameters
 
         INTEGER(4), PARAMETER :: UnControllerParameters = 89
         TYPE(ControlParameters), INTENT(INOUT) :: CntrPar
@@ -31,7 +34,12 @@ CONTAINS
         READ(UnControllerParameters, *) CntrPar%F_NotchType
         READ(UnControllerParameters, *) CntrPar%IPC_ControlMode
         READ(UnControllerParameters, *) CntrPar%VS_ControlMode
+        READ(UnControllerParameters, *) CntrPar%PC_ControlMode
         READ(UnControllerParameters, *) CntrPar%Y_ControlMode        
+        READ(UnControllerParameters, *) CntrPar%SS_Mode        
+        READ(UnControllerParameters, *) CntrPar%WE_Mode        
+        READ(UnControllerParameters, *) CntrPar%PS_Mode        
+        READ(UnControllerParameters, *) CntrPar%SD_Mode        
         READ(UnControllerParameters, *)
 
         !----------------- FILTER CONSTANTS ---------------------
@@ -41,6 +49,7 @@ CONTAINS
         READ(UnControllerParameters, *) CntrPar%F_NotchCornerFreq
         ALLOCATE(CntrPar%F_NotchBetaNumDen(2))
         READ(UnControllerParameters,*) CntrPar%F_NotchBetaNumDen
+        READ(UnControllerParameters,*) CntrPar%F_SSCornerFreq
         READ(UnControllerParameters, *)
 
         !----------- BLADE PITCH CONTROLLER CONSTANTS -----------
@@ -96,7 +105,14 @@ CONTAINS
         READ(UnControllerParameters,*) CntrPar%VS_KP
         ALLOCATE(CntrPar%VS_KI(CntrPar%VS_n))
         READ(UnControllerParameters,*) CntrPar%VS_KI
+        READ(UnControllerParameters,*) CntrPar%VS_TSRopt
         READ(UnControllerParameters, *)
+
+        !------- Setpoint Smoother --------------------------------
+        READ(UnControllerParameters, *)
+        READ(UnControllerParameters, *) CntrPar%SS_VSGain
+        READ(UnControllerParameters, *) CntrPar%SS_PCGain
+        READ(UnControllerParameters, *) 
 
         !------------ WIND SPEED ESTIMATOR CONTANTS --------------
         READ(UnControllerParameters, *)
@@ -108,6 +124,15 @@ CONTAINS
         READ(UnControllerParameters, *) CntrPar%WE_GearboxRatio
         READ(UnControllerParameters, *) CntrPar%WE_Jtot
         READ(UnControllerParameters, *) CntrPar%WE_RhoAir
+        READ(UnControllerParameters, *) CntrPar%PerfFileName
+        ALLOCATE(CntrPar%PerfTableSize(2))
+        READ(UnControllerParameters, *) CntrPar%PerfTableSize
+        READ(UnControllerParameters, *) CntrPar%WE_FOPoles_N
+        ALLOCATE(CntrPar%WE_FOPoles_v(CntrPar%WE_FOPoles_n))
+        READ(UnControllerParameters, *) CntrPar%WE_FOPoles_v
+        ALLOCATE(CntrPar%WE_FOPoles(CntrPar%WE_FOPoles_n))
+        READ(UnControllerParameters, *) CntrPar%WE_FOPoles
+
         READ(UnControllerParameters, *)
 
         !-------------- YAW CONTROLLER CONSTANTS -----------------
@@ -132,7 +157,21 @@ CONTAINS
         READ(UnControllerParameters, *) CntrPar%FA_KI  
         READ(UnControllerParameters, *) CntrPar%FA_HPFCornerFreq
         READ(UnControllerParameters, *) CntrPar%FA_IntSat
-        
+        READ(UnControllerParameters, *)      
+
+        !------------ PEAK SHAVING ------------
+        READ(UnControllerParameters, *)      
+        READ(UnControllerParameters, *) CntrPar%PS_BldPitchMin_N  
+        ALLOCATE(CntrPar%PS_WindSpeeds(CntrPar%PS_BldPitchMin_N))
+        READ(UnControllerParameters, *) CntrPar%PS_WindSpeeds
+        ALLOCATE(CntrPar%PS_BldPitchMin(CntrPar%PS_BldPitchMin_N))
+        READ(UnControllerParameters, *) CntrPar%PS_BldPitchMin
+        READ(UnControllerParameters, *) 
+
+        !------------ SHUTDOWN ------------
+        READ(UnControllerParameters, *)      
+        READ(UnControllerParameters, *) CntrPar%SD_MaxPit  
+        READ(UnControllerParameters, *) CntrPar%SD_CornerFreq
         ! END OF INPUT FILE    
         
         !------------------- CALCULATED CONSTANTS -----------------------
@@ -142,29 +181,78 @@ CONTAINS
         CntrPar%VS_Rgn3Pitch = CntrPar%PC_FinePit + CntrPar%PC_Switch
         
         CLOSE(UnControllerParameters)
-    END SUBROUTINE ReadControlParameterFileSub
-    
-    SUBROUTINE ComputeVariablesSetpoints(CntrPar, LocalVar)
-        USE DRC_Types, ONLY : ControlParameters, LocalVariables
         
-        ! Local variables
+        !------------------- HOUSEKEEPING -----------------------
+        CntrPar%PerfFileName = TRIM(CntrPar%PerfFileName)
+
+    END SUBROUTINE ReadControlParameterFileSub
+    ! -----------------------------------------------------------------------------------
+    ! Calculate setpoints for primary control actions    
+    SUBROUTINE ComputeVariablesSetpoints(CntrPar, LocalVar, objInst)
+        USE ROSCO_Types, ONLY : ControlParameters, LocalVariables, ObjectInstances
+        
+        ! Allocate variables
         TYPE(ControlParameters), INTENT(INOUT)  :: CntrPar
         TYPE(LocalVariables), INTENT(INOUT)     :: LocalVar
-        
-        ! Calculate yaw misalignment error
+        TYPE(ObjectInstances), INTENT(INOUT)    :: objInst
+
+        REAL(4)                                 :: VS_RefSpd        ! Referece speed for variable speed torque controller, [rad/s] 
+        REAL(4)                                 :: PC_RefSpd        ! Referece speed for pitch controller, [rad/s] 
+        REAL(4)                                 :: Omega_op         ! Optimal TSR-tracking generator speed, [rad/s]
+        REAL(4)                                 :: WE_Vw_f          ! Filtered Wind Speed Estimate
+        ! temp
+        ! REAL(4)                                 :: VS_TSRop = 7.5
+
+        ! ----- Calculate yaw misalignment error -----
         LocalVar%Y_MErr = LocalVar%Y_M + CntrPar%Y_MErrSet ! Yaw-alignment error
         
-        ! Compute the current speed AND power error
-        LocalVar%PC_SpdErr = CntrPar%PC_RefSpd - LocalVar%GenSpeedF            ! Speed error
+        ! ----- Pitch controller speed and power error -----
+        ! Implement setpoint smoothing
+        IF (LocalVar%SS_DelOmegaF < 0) THEN
+            PC_RefSpd = CntrPar%PC_RefSpd - LocalVar%SS_DelOmegaF
+        ELSE
+            PC_RefSpd = CntrPar%PC_RefSpd
+        ENDIF
+        LocalVar%PC_SpdErr = PC_RefSpd - LocalVar%GenSpeedF            ! Speed error
         LocalVar%PC_PwrErr = CntrPar%VS_RtPwr - LocalVar%VS_GenPwr             ! Power error
         
-        ! XXX
-        LocalVar%VS_SpdErrAr = CntrPar%VS_RefSpd - LocalVar%GenSpeedF       ! Current speed error - Above-rated PI-control
-        LocalVar%VS_SpdErrBr = CntrPar%VS_MinOMSpd - LocalVar%GenSpeedF     ! Current speed error - Below-rated PI-control
-    END SUBROUTINE ComputeVariablesSetpoints
+        ! ----- Torque controller reference errors -----
+        ! Define VS reference generator speed [rad/s]
+        IF (CntrPar%VS_ControlMode == 2) THEN
+            WE_Vw_f = LPFilter(LocalVar%We_Vw, LocalVar%DT, 0.625, LocalVar%iStatus, .FALSE., objInst%instLPF)
+            ! WE_Vw_f = LocalVar%We_Vw
+            VS_RefSpd = (CntrPar%VS_TSRopt * WE_Vw_f / CntrPar%WE_BladeRadius) * CntrPar%WE_GearboxRatio
+            VS_RefSpd = saturate(VS_RefSpd,CntrPar%VS_MinOMSpd, CntrPar%VS_RefSpd)
+        ELSE
+            VS_RefSpd = CntrPar%VS_RefSpd
+        ENDIF 
+
+        
+        ! Implement setpoint smoothing
+        IF (LocalVar%SS_DelOmegaF > 0) THEN
+            VS_RefSpd = VS_RefSpd - LocalVar%SS_DelOmegaF
+        ENDIF
+
+        ! Force zero torque in shutdown mode
+        IF (LocalVar%SD) THEN
+            VS_RefSpd = CntrPar%VS_MinOMSpd
+        ENDIF
+
+        ! TSR-tracking reference error
+        IF (CntrPar%VS_ControlMode == 2) THEN
+            LocalVar%VS_SpdErr = VS_RefSpd - LocalVar%GenSpeedF
+        ENDIF
+
+        ! Define transition region setpoint errors
+        LocalVar%VS_SpdErrAr = VS_RefSpd - LocalVar%GenSpeedF               ! Current speed error - Region 2.5 PI-control (Above Rated)
+        LocalVar%VS_SpdErrBr = CntrPar%VS_MinOMSpd - LocalVar%GenSpeedF     ! Current speed error - Region 1.5 PI-control (Below Rated)
     
+    
+    END SUBROUTINE ComputeVariablesSetpoints
+    ! -----------------------------------------------------------------------------------
+    ! Read avrSWAP array passed from ServoDyn    
     SUBROUTINE ReadAvrSWAP(avrSWAP, LocalVar)
-        USE DRC_Types, ONLY : LocalVariables
+        USE ROSCO_Types, ONLY : LocalVariables
     
         REAL(C_FLOAT), INTENT(INOUT) :: avrSWAP(*)   ! The swap array, used to pass data to, and receive data from, the DLL controller.
         TYPE(LocalVariables), INTENT(INOUT) :: LocalVar
@@ -173,7 +261,6 @@ CONTAINS
         LocalVar%iStatus = NINT(avrSWAP(1))
         LocalVar%Time = avrSWAP(2)
         LocalVar%DT = avrSWAP(3)
-        LocalVar%BlPitch(1) = avrSWAP(4)
         LocalVar%VS_MechGenPwr = avrSWAP(14)
         LocalVar%VS_GenPwr = avrSWAP(15)
         LocalVar%GenSpeed = avrSWAP(20)
@@ -184,16 +271,27 @@ CONTAINS
         LocalVar%rootMOOP(1) = avrSWAP(30)
         LocalVar%rootMOOP(2) = avrSWAP(31)
         LocalVar%rootMOOP(3) = avrSWAP(32)
-        LocalVar%BlPitch(2) = avrSWAP(33)
-        LocalVar%BlPitch(3) = avrSWAP(34)
         LocalVar%FA_Acc = avrSWAP(53)
         LocalVar%Azimuth = avrSWAP(60)
         LocalVar%NumBl = NINT(avrSWAP(61))
+
+          ! --- NJA: usually feedback back the previous pitch command helps for numerical stability, sometimes it does not...
+        IF (LocalVar%iStatus == 0) THEN
+            LocalVar%BlPitch(1) = avrSWAP(4)
+            LocalVar%BlPitch(2) = avrSWAP(33)
+            LocalVar%BlPitch(3) = avrSWAP(34)
+        ELSE
+            LocalVar%BlPitch(1) = LocalVar%PitCom(1)
+            LocalVar%BlPitch(2) = LocalVar%PitCom(2)
+            LocalVar%BlPitch(3) = LocalVar%PitCom(3)      
+        ENDIF
+
     END SUBROUTINE ReadAvrSWAP
-    
+    ! -----------------------------------------------------------------------------------
+    ! Check for errors before any execution
     SUBROUTINE Assert(LocalVar, CntrPar, avrSWAP, aviFAIL, ErrMsg, size_avcMSG)
         USE, INTRINSIC :: ISO_C_Binding
-        USE DRC_Types, ONLY : LocalVariables, ControlParameters
+        USE ROSCO_Types, ONLY : LocalVariables, ControlParameters
     
         IMPLICIT NONE
     
@@ -298,36 +396,38 @@ CONTAINS
             ErrMsg  = 'IPC_KI(2) must be zero or greater than zero.'
         ENDIF
         
-        IF (CntrPar%Y_IPC_omegaLP <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'Y_IPC_omegaLP must be greater than zero.'
+        ! ---- Yaw Control ----
+        IF (CntrPar%Y_ControlMode > 0) THEN
+            IF (CntrPar%Y_IPC_omegaLP <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'Y_IPC_omegaLP must be greater than zero.'
+            ENDIF
+            
+            IF (CntrPar%Y_IPC_zetaLP <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'Y_IPC_zetaLP must be greater than zero.'
+            ENDIF
+            
+            IF (CntrPar%Y_ErrThresh <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'Y_ErrThresh must be greater than zero.'
+            ENDIF
+            
+            IF (CntrPar%Y_Rate <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'CntrPar%Y_Rate must be greater than zero.'
+            ENDIF
+            
+            IF (CntrPar%Y_omegaLPFast <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'Y_omegaLPFast must be greater than zero.'
+            ENDIF
+            
+            IF (CntrPar%Y_omegaLPSlow <= 0.0)  THEN
+                aviFAIL = -1
+                ErrMsg  = 'Y_omegaLPSlow must be greater than zero.'
+            ENDIF
         ENDIF
-        
-        IF (CntrPar%Y_IPC_zetaLP <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'Y_IPC_zetaLP must be greater than zero.'
-        ENDIF
-        
-        IF (CntrPar%Y_ErrThresh <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'Y_ErrThresh must be greater than zero.'
-        ENDIF
-        
-        IF (CntrPar%Y_Rate <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'CntrPar%Y_Rate must be greater than zero.'
-        ENDIF
-        
-        IF (CntrPar%Y_omegaLPFast <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'Y_omegaLPFast must be greater than zero.'
-        ENDIF
-        
-        IF (CntrPar%Y_omegaLPSlow <= 0.0)  THEN
-            aviFAIL = -1
-            ErrMsg  = 'Y_omegaLPSlow must be greater than zero.'
-        ENDIF
-        
         ! Abort if the user has not requested a pitch angle actuator (See Appendix A
         ! of Bladed User's Guide):
         IF (NINT(avrSWAP(10)) /= 0)  THEN ! .TRUE. if a pitch angle actuator hasn't been requested
@@ -339,15 +439,18 @@ CONTAINS
             aviFAIL = -1
             ErrMsg  = 'IPC enabled, but Ptch_Cntrl in ServoDyn has a value of 0. Set it to 1.'
         ENDIF
+
     END SUBROUTINE Assert
-    
-    SUBROUTINE SetParameters(avrSWAP, aviFAIL, ErrMsg, size_avcMSG, CntrPar, LocalVar, objInst)
-        USE DRC_Types, ONLY : ControlParameters, LocalVariables, ObjectInstances
+    ! -----------------------------------------------------------------------------------
+    ! Define parameters for control actions
+    SUBROUTINE SetParameters(avrSWAP, aviFAIL, ErrMsg, size_avcMSG, CntrPar, LocalVar, objInst, PerfData)
+        USE ROSCO_Types, ONLY : ControlParameters, LocalVariables, ObjectInstances, PerformanceData
         
         INTEGER(4), INTENT(IN) :: size_avcMSG
         TYPE(ControlParameters), INTENT(INOUT) :: CntrPar
         TYPE(LocalVariables), INTENT(INOUT) :: LocalVar
         TYPE(ObjectInstances), INTENT(INOUT) :: objInst
+        TYPE(PerformanceData), INTENT(INOUT) :: PerfData
         
         REAL(C_FLOAT), INTENT(INOUT) :: avrSWAP(*)          ! The swap array, used to pass data to, and receive data from, the DLL controller.
         INTEGER(C_INT), INTENT(OUT) :: aviFAIL              ! A flag used to indicate the success of this DLL call set as follows: 0 if the DLL call was successful, >0 if the DLL call was successful but cMessage should be issued as a warning messsage, <0 if the DLL call was unsuccessful or for any other reason the simulation is to be stopped at this point with cMessage as the error message.
@@ -384,16 +487,24 @@ CONTAINS
             
             ! Inform users that we are using this user-defined routine:
             aviFAIL = 1
-            ErrMsg = '                                                          '//NEW_LINE('A')// &
-                     'Running the Delft Research Controller (DRC)               '//NEW_LINE('A')// &
-                     'A wind turbine controller for use in the scientific field '//NEW_LINE('A')// &
-                     'Written by S.P. Mulders, Jan-Willem van Wingerden         '//NEW_LINE('A')// &
-                     'Delft University of Technology, The Netherlands           '//NEW_LINE('A')// &
-                     'Visit our GitHub-page to contribute to this project:      '//NEW_LINE('A')// &
-                     'https://github.com/TUDelft-DataDrivenControl              '
-            
+            ErrMsg = '                                                                              '//NEW_LINE('A')// &
+                     '------------------------------------------------------------------------------'//NEW_LINE('A')// &
+                     'Running a controller implemented through NREL''s ROSCO Toolbox                    '//NEW_LINE('A')// &
+                     'A wind turbine controller framework for public use in the scientific field    '//NEW_LINE('A')// &
+                     'Developed in collaboration: National Renewable Energy Laboratory              '//NEW_LINE('A')// &
+                     '                            Delft University of Technology, The Netherlands   '//NEW_LINE('A')// &
+                     'Primary development by (listed alphabetically): Nikhar J. Abbas               '//NEW_LINE('A')// &
+                     '                                                Sebastiaan P. Mulders         '//NEW_LINE('A')// &
+                     '                                                Jan-Willem van Wingerden      '//NEW_LINE('A')// &
+                     'Visit our GitHub-page to contribute to this project:                          '//NEW_LINE('A')// &
+                     'https://github.com/NREL/ROSCO                                                 '//NEW_LINE('A')// &
+                     '------------------------------------------------------------------------------'
+
             CALL ReadControlParameterFileSub(CntrPar)
-            
+
+            IF (CntrPar%WE_Mode > 0) THEN
+                CALL READCpFile(CntrPar,PerfData)
+            ENDIF
             ! Initialize testValue (debugging variable)
             LocalVar%TestType = 0
         
@@ -410,9 +521,72 @@ CONTAINS
             LocalVar%WE_Vw = 10
             LocalVar%WE_VwI = LocalVar%WE_Vw - CntrPar%WE_Gamma*LocalVar%RotSpeed
             
+            ! Setpoint Smoother initialization to zero
+            LocalVar%SS_DelOmegaF = 0
+
+            ! Generator Torque at K omega^2 or rated
+            IF (LocalVar%GenSpeed > 0.98 * CntrPar%PC_RefSpd) THEN
+                LocalVar%GenTq = CntrPar%VS_RtTq
+            ELSE
+                LocalVar%GenTq = min(CntrPar%VS_RtTq, CntrPar%VS_Rgn2K*LocalVar%GenSpeed*LocalVar%GenSpeed)
+            ENDIF            
+            LocalVar%VS_LastGenTrq = LocalVar%GenTq       
+            
             ! Check validity of input parameters:
             CALL Assert(LocalVar, CntrPar, avrSWAP, aviFAIL, ErrMsg, size_avcMSG)
             
+
         ENDIF
     END SUBROUTINE SetParameters
+    ! -----------------------------------------------------------------------------------
+    ! Read all constant control parameters from DISCON.IN parameter file
+    SUBROUTINE ReadCpFile(CntrPar,PerfData)
+        USE ROSCO_Types, ONLY : PerformanceData, ControlParameters
+
+        INTEGER(4), PARAMETER :: UnPerfParameters = 89
+        TYPE(PerformanceData), INTENT(INOUT) :: PerfData
+        TYPE(ControlParameters), INTENT(INOUT) :: CntrPar
+        ! Local variables
+        INTEGER(4)                  :: i ! iteration index
+        OPEN(unit=UnPerfParameters, file=TRIM(CntrPar%PerfFileName), status='old', action='read') ! Should put input file into DISCON.IN
+        
+        ! ----------------------- Axis Definitions ------------------------
+        READ(UnPerfParameters, *)
+        READ(UnPerfParameters, *)
+        READ(UnPerfParameters, *)
+        READ(UnPerfParameters, *)
+        ALLOCATE(PerfData%Beta_vec(CntrPar%PerfTableSize(1)))
+        READ(UnPerfParameters, *) PerfData%Beta_vec
+        READ(UnPerfParameters, *) 
+        ALLOCATE(PerfData%TSR_vec(CntrPar%PerfTableSize(2)))
+        READ(UnPerfParameters, *) PerfData%TSR_vec
+
+        ! ----------------------- Read Cp, Ct, Cq, Tables ------------------------
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) ! Input file should contains wind speed information here - unneeded for now
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        ALLOCATE(PerfData%Cp_mat(CntrPar%PerfTableSize(2),CntrPar%PerfTableSize(1)))
+        DO i = 1,CntrPar%PerfTableSize(2)
+            READ(UnPerfParameters, *) PerfData%Cp_mat(i,:) ! Read Cp table
+        END DO
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        ALLOCATE(PerfData%Ct_mat(CntrPar%PerfTableSize(1),CntrPar%PerfTableSize(2)))
+        DO i = 1,CntrPar%PerfTableSize(2)
+            READ(UnPerfParameters, *) PerfData%Ct_mat(i,:) ! Read Ct table
+        END DO
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        READ(UnPerfParameters, *) 
+        ALLOCATE(PerfData%Cq_mat(CntrPar%PerfTableSize(1),CntrPar%PerfTableSize(2)))
+        DO i = 1,CntrPar%PerfTableSize(2)
+            READ(UnPerfParameters, *) PerfData%Ct_mat(i,:) ! Read Cq table
+        END DO
+    
+    END SUBROUTINE ReadCpFile
 END MODULE ReadSetParameters

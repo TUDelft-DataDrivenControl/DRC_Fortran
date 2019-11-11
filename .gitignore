@@ -8,6 +8,7 @@ Source/Obj_lin64
 *.mod
 Source/x64/
 Source/Release/
+Build/
 
 # Archive
 Scripts/CompileDISCONHereCopyRun\.cmd
@@ -16,4 +17,6 @@ Scripts/CompileDISCONHereCopyRun\.cmd
 
 # Temp Files
 *~
+*.u2d
+.DS_Store
 *.u2d
